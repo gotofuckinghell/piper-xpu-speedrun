@@ -1,0 +1,553 @@
+--- a/src/piper/train/vits/dataset.py
++++ b/src/piper/train/vits/dataset.py
+@@ -4,8 +4,10 @@
+ import itertools
+ import json
+ import logging
++import os
+ import math
+ import os
++import time
+ import unicodedata
+ from dataclasses import dataclass
+ from enum import Enum
+@@ -29,8 +31,35 @@
+ from .utils import get_cache_id
+ 
+ _LOGGER = logging.getLogger(__name__)
++_ROW_OFFSET = int(os.environ.get("PIPER_ROW_OFFSET", "0"))
+ VAD_SAMPLE_RATE = 16000
+ 
++# Компактный кэш: один файл <id>.compact.pt = {"audio_i16", "audio_dtype",
++# "phonemes", "sr"} вместо пары .audio.pt (~612 КБ) + .spec.pt (~1.2 МБ).
++# Спектрограмма считается на лету в UtteranceCollate.
++_COMPACT = os.environ.get("PIPER_COMPACT") == "1"
++# Загрузить все compact-файлы в RAM один раз в setup() (имеет смысл при
++# num_workers=0: иначе каждый воркер получит свою копию).
++_PREFER_LEGACY = os.environ.get("PIPER_PREFER_LEGACY", "") == "1"
++_CACHE_RAM = os.environ.get("PIPER_CACHE_RAM") == "1"
++
++
++def _worker_init(_worker_id: int) -> None:
++    """Один поток на воркер: иначе N воркеров дерутся за ядра с XPU-диспетчером."""
++    os.environ.setdefault("OMP_NUM_THREADS", "1")
++    os.environ.setdefault("MKL_NUM_THREADS", "1")
++    try:
++        torch.set_num_threads(1)
++        torch.set_num_interop_threads(1)
++    except Exception:  # noqa: BLE001
++        pass
++# Тип хранения аудио в compact-файле: "int16" (по умолчанию) или "float16".
++# Замер на 30 репликах: int16 -> SNR 90.3 дБ (max abs 3.0e-3 при magnitude 130,
++# т.е. 3.1e-5 относительно), float16 -> SNR 76.2 дБ (max abs 5.0e-3).
++# Для аудио, нормированного в [-1, 1], int16 точнее fp16 почти на порядок.
++_COMPACT_DTYPE = os.environ.get("PIPER_COMPACT_DTYPE", "int16").lower()
++_AUDIO_I16_SCALE = 32767.0
++
+ 
+ @dataclass
+ class CachedUtterance:
+@@ -39,6 +68,83 @@
+     audio_spec_path: Path
+     text: Optional[str] = None
+     speaker_id: Optional[int] = None
++    # Компактный кэш. Если задан, .audio.pt/.spec.pt не нужны; пути выше всё
++    # равно заполнены (на них смотрит остальной код, напр. lightning.py), но
++    # файлы могут отсутствовать.
++    compact_path: Optional[Path] = None
++    # PIPER_CACHE_RAM=1: тензоры, предзагруженные в setup().
++    ram_phoneme_ids: Optional[torch.Tensor] = None
++    ram_audio_i16: Optional[torch.Tensor] = None
++
++    @property
++    def is_compact(self) -> bool:
++        return (self.compact_path is not None) or (self.ram_audio_i16 is not None)
++
++    @property
++    def length_bytes(self) -> int:
++        """Прокси длины реплики для LengthBucketSampler (размер кэша)."""
++        if self.ram_audio_i16 is not None:
++            # *4: сравнима с float32-размером .audio.pt
++            return self.ram_audio_i16.numel() * 4
++        for path in (self.audio_norm_path, self.compact_path):
++            if path is None:
++                continue
++            try:
++                return os.path.getsize(path)
++            except OSError:
++                continue
++        return 0
++
++
++def _audio_to_int16(audio: torch.Tensor) -> torch.Tensor:
++    """float32 [-1, 1] -> int16 (масштаб 32767, с обрезкой)."""
++    return (
++        (audio.detach().to(torch.float32) * _AUDIO_I16_SCALE)
++        .round_()
++        .clamp_(-32767, 32767)
++        .to(torch.int16)
++    )
++
++
++def _int16_to_audio(audio_i16: torch.Tensor) -> torch.Tensor:
++    """int16 -> float32 [-1, 1] (новый тензор, оригинал не меняется)."""
++    return audio_i16.to(torch.float32).div_(_AUDIO_I16_SCALE)
++
++
++def _audio_to_compact(
++    audio: torch.Tensor, dtype: str = _COMPACT_DTYPE
++) -> torch.Tensor:
++    """float32 [-1, 1] -> компактное представление (int16 по умолчанию)."""
++    if dtype == "float16":
++        return audio.detach().to(torch.float16)
++    return _audio_to_int16(audio)
++
++
++def _compact_to_audio(audio: torch.Tensor) -> torch.Tensor:
++    """Компактное представление -> float32 [-1, 1]."""
++    if audio.dtype == torch.int16:
++        return _int16_to_audio(audio)
++    return audio.to(torch.float32)
++
++
++def _mel_from_int16(
++    audio_i16: torch.Tensor,
++    n_fft: int,
++    sampling_rate: int,
++    hop_size: int,
++    win_size: int,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """(audio_norm, spectrogram) из компактного аудио — те же формулы, что и prepare."""
++    audio = _compact_to_audio(audio_i16)
++    spec = spectrogram_torch(
++        y=audio.unsqueeze(0),
++        n_fft=n_fft,
++        sampling_rate=sampling_rate,
++        hop_size=hop_size,
++        win_size=win_size,
++        center=False,
++    ).squeeze(0)
++    return audio, spec
+ 
+ 
+ class DatasetType(str, Enum):
+@@ -219,15 +325,17 @@
+ 
+             self.piper_config.speaker_id_map = speaker_id_map
+ 
+-        # Write config
++        # Write config (атомарно: при параллельной сборке кэша пишут 16 процессов)
+         self.config_path.parent.mkdir(parents=True, exist_ok=True)
+-        with open(self.config_path, "w", encoding="utf-8") as config_file:
++        _tmp_config = self.config_path.with_suffix(f".{os.getpid()}.tmp")
++        with open(_tmp_config, "w", encoding="utf-8") as config_file:
+             json.dump(
+                 self.piper_config.to_dict(),
+                 config_file,
+                 ensure_ascii=False,
+                 indent=2,
+             )
++        os.replace(_tmp_config, self.config_path)
+ 
+         if self.phoneme_type == PhonemeType.PINYIN:
+             from piper.phonemize_chinese import ChinesePhonemizer
+@@ -300,6 +408,8 @@
+         with open(self.csv_path, "r", encoding="utf-8") as csv_file:
+             reader = csv.reader(csv_file, delimiter="|")
+             for row_number, row in enumerate(reader, start=1):
++                # сдвиг нумерации для параллельной сборки кэша по шардам
++                row_number += _ROW_OFFSET
+                 utt_id = row[0]
+                 speaker_id: Optional[int] = None
+                 if self.is_multispeaker:
+@@ -330,6 +440,9 @@
+ 
+                 cache_id = get_cache_id(row_number, text, speaker_id=speaker_id)
+ 
++                # Тензор ids, если он посчитан в этой итерации (для compact-файла)
++                phoneme_ids_tensor: Optional[torch.Tensor] = None
++
+                 # text
+                 text_path = self.cache_dir / f"{cache_id}.txt"
+                 if not text_path.exists():
+@@ -348,7 +461,8 @@
+                     # phoneme ids
+                     phoneme_ids_path = self.cache_dir / f"{cache_id}.phonemes.pt"
+                     if not phoneme_ids_path.exists():
+-                        torch.save(torch.LongTensor(phoneme_ids), phoneme_ids_path)
++                        phoneme_ids_tensor = torch.LongTensor(phoneme_ids)
++                        torch.save(phoneme_ids_tensor, phoneme_ids_path)
+                         if report_prepare is None:
+                             report_prepare = True
+                 else:
+@@ -382,31 +496,19 @@
+                                 )
+                             )
+                         )
+-                        torch.save(torch.LongTensor(phoneme_ids), phoneme_ids_path)
++                        phoneme_ids_tensor = torch.LongTensor(phoneme_ids)
++                        torch.save(phoneme_ids_tensor, phoneme_ids_path)
+                         if report_prepare is None:
+                             report_prepare = True
+ 
+                 # normalized audio
+                 norm_audio_path = self.cache_dir / f"{cache_id}.audio.pt"
+-                audio_norm_tensor: Optional[torch.Tensor] = None
+-                if not norm_audio_path.exists():
+-                    audio_norm_array, audio_sample_rate = librosa.load(
+-                        path=audio_path, sr=self.sample_rate, mono=True
+-                    )
+-                    if self.trim_silence:
+-                        if audio_sample_rate != VAD_SAMPLE_RATE:
+-                            # VAD needs 16Khz
+-                            audio_16khz_array, _sr = librosa.load(
+-                                path=audio_path, sr=VAD_SAMPLE_RATE, mono=True
+-                            )
+-                        else:
+-                            audio_16khz_array = audio_norm_array
+-
+-                        audio_norm_array = self._trim_silence(
+-                            audio_norm_array, audio_16khz_array, vad
+-                        )
++                compact_path = self.cache_dir / f"{cache_id}.compact.pt"
++                audio_spec_path = self.cache_dir / f"{cache_id}.spec.pt"
+ 
+-                    audio_norm_tensor = torch.FloatTensor(audio_norm_array)
++                audio_norm_tensor: Optional[torch.Tensor] = None
++                if not norm_audio_path.exists() and not _COMPACT:
++                    audio_norm_tensor = self._load_audio_norm(audio_path, vad)
+                     torch.save(
+                         audio_norm_tensor,
+                         norm_audio_path,
+@@ -414,9 +516,37 @@
+                     if report_prepare is None:
+                         report_prepare = True
+ 
+-                # mel spectrogram
+-                audio_spec_path = self.cache_dir / f"{cache_id}.spec.pt"
+-                if not audio_spec_path.exists():
++                if _COMPACT:
++                    # Один файл на реплику: int16-аудио + phoneme ids + sr.
++                    if not compact_path.exists():
++                        if audio_norm_tensor is None:
++                            if norm_audio_path.exists():
++                                audio_norm_tensor = torch.load(norm_audio_path)
++                            else:
++                                audio_norm_tensor = self._load_audio_norm(
++                                    audio_path, vad
++                                )
++
++                        if phoneme_ids_tensor is None:
++                            phoneme_ids_tensor = torch.load(phoneme_ids_path)
++
++                        audio_compact = _audio_to_compact(audio_norm_tensor)
++                        torch.save(
++                            {
++                                # имя ключа историческое (см. audio_dtype)
++                                "audio_i16": audio_compact,
++                                "audio_dtype": str(audio_compact.dtype).replace(
++                                    "torch.", ""
++                                ),
++                                "phonemes": phoneme_ids_tensor,
++                                "sr": self.sample_rate,
++                            },
++                            compact_path,
++                        )
++                        if report_prepare is None:
++                            report_prepare = True
++                elif not audio_spec_path.exists():
++                    # mel spectrogram
+                     if audio_norm_tensor is None:
+                         # Load audio from cache
+                         audio_norm_tensor = torch.load(norm_audio_path)
+@@ -443,6 +573,9 @@
+                     report_prepare = False
+ 
+         _LOGGER.info("Processed %s utterance(s)", num_utterances)
++        if os.environ.get("PIPER_CACHE_ONLY") == "1":
++            _LOGGER.info("PIPER_CACHE_ONLY=1: кэш собран, выходим")
++            raise SystemExit(0)
+ 
+     def setup(self, stage: str) -> None:
+         assert self.piper_config is not None
+@@ -453,6 +586,8 @@
+         with open(self.csv_path, "r", encoding="utf-8") as csv_file:
+             reader = csv.reader(csv_file, delimiter="|")
+             for row_number, row in enumerate(reader, start=1):
++                # сдвиг нумерации для параллельной сборки кэша по шардам
++                row_number += _ROW_OFFSET
+                 utt_id = row[0]
+                 speaker_id: Optional[int] = None
+                 if self.is_multispeaker:
+@@ -511,6 +646,20 @@
+                 if text_path.exists():
+                     text = text_path.read_text(encoding="utf-8")
+ 
++                compact_path = self.cache_dir / f"{cache_id}.compact.pt"
++                if _COMPACT and compact_path.exists() and not _PREFER_LEGACY:
++                    all_utts.append(
++                        CachedUtterance(
++                            phoneme_ids_path=phoneme_ids_path,
++                            audio_norm_path=audio_norm_path,
++                            audio_spec_path=audio_spec_path,
++                            text=text,
++                            speaker_id=speaker_id,
++                            compact_path=compact_path,
++                        )
++                    )
++                    continue
++
+                 all_utts.append(
+                     CachedUtterance(
+                         phoneme_ids_path=phoneme_ids_path,
+@@ -521,14 +670,35 @@
+                     )
+                 )
+ 
++        if _CACHE_RAM:
++            self._preload_compact_ram(all_utts)
++
++        # Фильтр по длине: PIPER_MAX_SEC + манифест длительностей
++        _max_sec = os.environ.get("PIPER_MAX_SEC", "").strip()
++        _manifest = os.environ.get("PIPER_MANIFEST", "").strip()
++        if _max_sec and _manifest and Path(_manifest).exists():
++            import json as _json
++            _lens = _json.loads(Path(_manifest).read_text(encoding="utf-8"))
++            _limit = float(_max_sec) * self.sample_rate
++            _before = len(all_utts)
++            all_utts = [
++                u for u in all_utts
++                if _lens.get(u.compact_path.name[: -len(".compact.pt")] if u.compact_path else "", 0) <= _limit
++            ]
++            _LOGGER.info(
++                "PIPER_MAX_SEC=%.1f: оставлено %d реплик из %d", float(_max_sec), len(all_utts), _before
++            )
++
+         full_dataset = VitsDataset(all_utts)
+ 
+         n = len(full_dataset)
+         valid_set_size = int(n * self.validation_split)
+         num_test = min(self.num_test_examples, max(0, n - valid_set_size - 1))
+         train_set_size = n - valid_set_size - num_test
++        # Без seed состав train/val меняется каждый запуск — метрики несравнимы.
++        _gen = torch.Generator().manual_seed(int(os.environ.get("PIPER_SPLIT_SEED", "1234")))
+         self.train_dataset, self.test_dataset, self.val_dataset = random_split(
+-            full_dataset, [train_set_size, num_test, valid_set_size]
++            full_dataset, [train_set_size, num_test, valid_set_size], generator=_gen
+         )
+ 
+     def _make_dataloader(
+@@ -540,10 +710,16 @@
+     ) -> DataLoader:
+         kwargs = dict(
+             collate_fn=UtteranceCollate(
+-                is_multispeaker=(self.num_speakers > 1), segment_size=self.segment_size
++                is_multispeaker=(self.num_speakers > 1),
++                segment_size=self.segment_size,
++                filter_length=self.filter_length,
++                hop_length=self.hop_length,
++                win_length=self.win_length,
++                sample_rate=self.sample_rate,
+             ),
+             num_workers=self.num_workers,
+-            pin_memory=True,
++            # По умолчанию как раньше: True. PIPER_PIN=0 отключает пиннинг.
++            pin_memory=os.environ.get("PIPER_PIN", "1") == "1",
+         )
+         if batch_sampler is not None:
+             # batch_sampler owns batching entirely; DataLoader rejects
+@@ -556,7 +732,8 @@
+         # persistent_workers/prefetch_factor are only valid with workers
+         if self.num_workers > 0:
+             kwargs["persistent_workers"] = True
+-            kwargs["prefetch_factor"] = 4
++            kwargs["prefetch_factor"] = 3
++            kwargs["worker_init_fn"] = _worker_init
+         return DataLoader(dataset, **kwargs)
+ 
+     def train_dataloader(self):
+@@ -599,6 +776,67 @@
+     def val_dataloader(self):
+         return self._make_dataloader(self.val_dataset)
+ 
++    def _preload_compact_ram(self, all_utts: List[CachedUtterance]) -> None:
++        """PIPER_CACHE_RAM=1: поднять все compact-файлы в RAM один раз.
++
++        Объекты живут в главном процессе; при num_workers>0 каждый воркер
++        получит свою копию (форк/спавн), поэтому режим рассчитан на num_workers=0.
++        """
++        compact_utts = [u for u in all_utts if u.compact_path is not None]
++        if not compact_utts:
++            _LOGGER.warning(
++                "PIPER_CACHE_RAM=1, но compact-файлов нет (нужен PIPER_COMPACT=1 при сборке кэша)"
++            )
++            return
++
++        if self.num_workers > 0:
++            _LOGGER.warning(
++                "PIPER_CACHE_RAM=1 при num_workers=%d: воркеры скопируют кэш в память; рекомендуется num_workers=0",
++                self.num_workers,
++            )
++
++        start_s = time.perf_counter()
++        total_bytes = 0
++        for utt in compact_utts:
++            payload = torch.load(utt.compact_path)
++            utt.ram_audio_i16 = payload["audio_i16"]
++            utt.ram_phoneme_ids = payload["phonemes"]
++            total_bytes += (
++                utt.ram_audio_i16.numel() * utt.ram_audio_i16.element_size()
++                + utt.ram_phoneme_ids.numel() * utt.ram_phoneme_ids.element_size()
++            )
++
++        elapsed_s = time.perf_counter() - start_s
++        _LOGGER.info(
++            "PIPER_CACHE_RAM=1: %d compact-реплик в RAM = %.1f МБ, загрузка %.2f с (%.3f мс/реплику)",
++            len(compact_utts),
++            total_bytes / (1024 * 1024),
++            elapsed_s,
++            1000.0 * elapsed_s / len(compact_utts),
++        )
++
++    def _load_audio_norm(
++        self, audio_path: Path, vad: SileroVoiceActivityDetector
++    ) -> torch.Tensor:
++        """Загрузить wav, привести к self.sample_rate и (опционально) обрезать тишину."""
++        audio_norm_array, audio_sample_rate = librosa.load(
++            path=audio_path, sr=self.sample_rate, mono=True
++        )
++        if self.trim_silence:
++            if audio_sample_rate != VAD_SAMPLE_RATE:
++                # VAD needs 16Khz
++                audio_16khz_array, _sr = librosa.load(
++                    path=audio_path, sr=VAD_SAMPLE_RATE, mono=True
++                )
++            else:
++                audio_16khz_array = audio_norm_array
++
++            audio_norm_array = self._trim_silence(
++                audio_norm_array, audio_16khz_array, vad
++            )
++
++        return torch.FloatTensor(audio_norm_array)
++
+     def _trim_silence(
+         self,
+         audio_original_array: np.ndarray,
+@@ -662,13 +900,17 @@
+ @dataclass
+ class UtteranceTensors:
+     phoneme_ids: LongTensor
+-    spectrogram: FloatTensor
+-    audio_norm: FloatTensor
++    # Компактный кэш: spectrogram/audio_norm считаются на лету в UtteranceCollate
++    # из audio_i16, поэтому здесь они могут быть None.
++    spectrogram: Optional[FloatTensor]
++    audio_norm: Optional[FloatTensor]
+     speaker_id: Optional[LongTensor] = None
+     text: Optional[str] = None
++    audio_i16: Optional[torch.Tensor] = None
+ 
+     @property
+     def spec_length(self) -> int:
++        assert self.spectrogram is not None, "spectrogram is not computed yet"
+         return self.spectrogram.size(1)
+ 
+ 
+@@ -719,11 +961,8 @@
+ 
+         self.lengths: List[int] = []
+         for utt in utterances:
+-            try:
+-                self.lengths.append(os.path.getsize(utt.audio_norm_path))
+-            except OSError:
+-                # Sorts with the shortest; a missing file fails later anyway.
+-                self.lengths.append(0)
++            # length_bytes: .audio.pt, либо .compact.pt, либо RAM-тензор
++            self.lengths.append(utt.length_bytes)
+ 
+     def __len__(self) -> int:
+         if self.drop_last:
+@@ -757,6 +996,33 @@
+ 
+     def __getitem__(self, idx) -> UtteranceTensors:
+         utt = self.utts[idx]
++
++        if utt.compact_path is not None or utt.ram_audio_i16 is not None:
++            # Компактный кэш: int16-аудио + phoneme ids в одном файле (или в RAM).
++            if utt.ram_audio_i16 is not None:
++                audio_i16 = utt.ram_audio_i16
++                phoneme_ids = utt.ram_phoneme_ids
++            else:
++                payload = torch.load(utt.compact_path)
++                audio_i16 = payload["audio_i16"]
++                phoneme_ids = payload["phonemes"]
++
++            assert audio_i16 is not None
++            assert phoneme_ids is not None
++
++            return UtteranceTensors(
++                phoneme_ids=phoneme_ids,
++                audio_norm=None,
++                spectrogram=None,
++                speaker_id=(
++                    LongTensor([utt.speaker_id])
++                    if utt.speaker_id is not None
++                    else None
++                ),
++                text=utt.text,
++                audio_i16=audio_i16,
++            )
++
+         return UtteranceTensors(
+             phoneme_ids=torch.load(utt.phoneme_ids_path),
+             audio_norm=torch.load(utt.audio_norm_path),
+@@ -769,14 +1035,47 @@
+ 
+ 
+ class UtteranceCollate:
+-    def __init__(self, is_multispeaker: bool, segment_size: int):
++    def __init__(
++        self,
++        is_multispeaker: bool,
++        segment_size: int,
++        filter_length: int = 1024,
++        hop_length: int = 256,
++        win_length: int = 1024,
++        sample_rate: int = 22050,
++    ):
+         self.is_multispeaker = is_multispeaker
+         self.segment_size = segment_size
++        self.filter_length = filter_length
++        self.hop_length = hop_length
++        self.win_length = win_length
++        self.sample_rate = sample_rate
++
++    def _materialize_compact(self, utterances: Sequence[UtteranceTensors]) -> None:
++        """Посчитать mel на лету для реплик из компактного кэша."""
++        for utt in utterances:
++            if utt.spectrogram is not None:
++                continue
++
++            assert utt.audio_i16 is not None, "No spectrogram and no int16 audio"
++
++            audio_norm, spec = _mel_from_int16(
++                utt.audio_i16.cpu(),
++                n_fft=self.filter_length,
++                sampling_rate=self.sample_rate,
++                hop_size=self.hop_length,
++                win_size=self.win_length,
++            )
++            utt.audio_norm = audio_norm
++            utt.spectrogram = spec
+ 
+     def __call__(self, utterances: Sequence[UtteranceTensors]) -> Batch:
+         num_utterances = len(utterances)
+         assert num_utterances > 0, "No utterances"
+ 
++        # Компактный кэш: mel считается здесь, а не читается с диска.
++        self._materialize_compact(utterances)
++
+         max_phonemes_length = 0
+         max_spec_length = 0
+         max_audio_length = 0

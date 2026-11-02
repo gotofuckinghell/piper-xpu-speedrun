@@ -1,0 +1,10 @@
+# Versions measured on the reference machine.
+# Install torch/torchaudio from the Intel XPU index first:
+#   pip install torch==2.14.1 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/xpu
+torch==2.14.1+xpu
+torchaudio==2.11.0+xpu
+lightning==2.6.6
+numpy==2.5.4
+piper-tts[train]==1.8.0
+# optional: faster parsing of the alignment TextGrids
+Cython>=3.0

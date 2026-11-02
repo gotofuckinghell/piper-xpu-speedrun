@@ -1,0 +1,465 @@
+--- a/src/piper/train/vits/lightning.py
++++ b/src/piper/train/vits/lightning.py
+@@ -4,6 +4,8 @@
+ import logging
+ import operator
+ import os
++import time
++from contextlib import nullcontext
+ from functools import reduce
+ from typing import Optional
+ 
+@@ -243,7 +245,7 @@
+ 
+         # Optional perceptual-quality predictor (lazily loaded on first use).
+         self._mos_predictor: Optional[MosPredictor] = None
+-        if mos_metric and (mos_metric.lower() != "none"):
++        if mos_metric and (mos_metric.lower() != "none") and os.environ.get("PIPER_NO_MOS") != "1":
+             self._mos_predictor = MosPredictor(mos_metric.lower())
+ 
+     def forward(self, text, text_lengths, scales, sid=None):
+@@ -262,6 +264,14 @@
+         return audio
+ 
+     def _compute_loss(self, batch: Batch):
++        _pm = os.environ.get("PIPER_TIMERS") == "1"
++        if _pm:
++            torch.xpu.synchronize(); _t0m = time.perf_counter()
++        if os.environ.get("PIPER_BF16") == "1":
++            for _f in ("spectrograms", "audios"):
++                _v = getattr(batch, _f, None)
++                if _v is not None and _v.is_floating_point():
++                    setattr(batch, _f, _v.to(torch.bfloat16))
+         # g step
+         x, x_lengths, y, _, spec, spec_lengths, speaker_ids = (
+             batch.phoneme_ids,
+@@ -281,6 +291,9 @@
+             z_mask,
+             (_z, z_p, m_p, logs_p, _m_q, logs_q),
+         ) = self.model_g(x, x_lengths, spec, spec_lengths, speaker_ids)
++        _pm = os.environ.get("PIPER_TIMERS") == "1"
++        if _pm:
++            torch.xpu.synchronize(); _t_g = time.perf_counter()
+ 
+         # Mel/STFT must run in fp32: cuFFT does not support bf16, and a stable
+         # mel L1 wants full precision anyway. Disable autocast and cast the
+@@ -316,9 +329,18 @@
+             self.hparams.segment_size,
+         )  # slice
+ 
++        if _pm:
++            torch.xpu.synchronize(); _t_mel = time.perf_counter()
+         # Trim to avoid padding issues
+         y_hat = y_hat[..., : y.shape[-1]]
+ 
++        _freeze_d = os.environ.get("PIPER_D_FREEZE") == "1"
++        if _freeze_d:
++            for _p in self.model_d.parameters():
++                _p.requires_grad_(False)
++            if self.model_mrd is not None:
++                for _p in self.model_mrd.parameters():
++                    _p.requires_grad_(False)
+         _y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.model_d(y, y_hat)
+         if self.model_mrd is not None:
+             _y_dr_r, y_dr_g, fmap_r_mrd, fmap_g_mrd = self.model_mrd(y, y_hat)
+@@ -378,6 +400,12 @@
+             metrics["mrd_fm"] = loss_mrd_fm.detach()
+             metrics["mrd_disc"] = loss_mrd_disc.detach()
+ 
++        if _pm:
++            torch.xpu.synchronize(); _t_all = time.perf_counter()
++            _LOGGER.info(
++                "PIPER_SPLIT g_forward=%.3f mel=%.3f rest=%.3f",
++                _t_g - _t0m, _t_mel - _t_g, _t_all - _t_mel,
++            )
+         return loss_gen_all, loss_disc_all, metrics
+ 
+     @property
+@@ -393,9 +421,174 @@
+         optimizers = getattr(getattr(self, "_trainer", None), "optimizers", None)
+         return self.global_step // max(1, len(optimizers or [None]))
+ 
++    def on_train_end(self) -> None:
++        if getattr(self, "_prof", None) is not None:
++            try:
++                self._prof.__exit__(None, None, None)
++            except Exception:  # noqa: BLE001
++                pass
++            self._prof = None
++        try:
++            elapsed = time.time() - getattr(self, "_t_train_start", time.time())
++            steps = int(self.true_global_step)
++            _LOGGER.info("PIPER_TIMING steps=%d seconds=%.1f", steps, elapsed)
++        except Exception:  # noqa: BLE001
++            _LOGGER.debug("Не удалось записать тайминг", exc_info=True)
++        # Статистика памяти раньше стояла внутри except и не выводилась никогда.
++        try:
++            if hasattr(torch, "xpu"):
++                alloc = torch.xpu.memory_allocated() / 2**20
++                reserved = torch.xpu.memory_reserved() / 2**20
++                peak_alloc = torch.xpu.max_memory_allocated() / 2**20
++                peak_res = torch.xpu.max_memory_reserved() / 2**20
++                retries = torch.xpu.memory_stats().get("num_alloc_retries", -1)
++                _LOGGER.info(
++                    "XPU память: allocated %.0f МиБ, reserved %.0f МиБ, "
++                    "пик allocated %.0f МиБ, пик reserved %.0f МиБ, "
++                    "alloc_retries %s",
++                    alloc, reserved, peak_alloc, peak_res, retries,
++                )
++        except Exception:  # noqa: BLE001
++            _LOGGER.debug("Не удалось снять статистику памяти XPU", exc_info=True)
++
++    def _amp_ctx(self):
++        """PIPER_AMP=bf16: autocast без перевода весов в bf16.
++
++        Веса остаются fp32 (мастер-копия), форвард и лоссы считаются в bf16 —
++        это и экономит память под большие батчи. GradScaler для bf16 не нужен.
++        """
++        mode = os.environ.get("PIPER_AMP", "").strip().lower()
++        if mode in ("bf16", "bfloat16"):
++            return torch.amp.autocast(
++                device_type=self.device.type, dtype=torch.bfloat16
++            )
++        return nullcontext()
++
++    # ---- раздельные проходы G и D (PIPER_SPLIT_GD=1) -------------------
++    def _train_step_split(self, batch: Batch, batch_idx: int):
++        """G и D считаются раздельно: D заморожен на G-шаге, свои градиенты
++        получает только на своём проходе. Экономит backward по весам D."""
++        opt_g, opt_d = self.optimizers()
++        with self._amp_ctx():
++            y, y_hat, loss_g, metrics = self._compute_g_part(batch)
++
++        opt_g.zero_grad(set_to_none=True)
++        self.manual_backward(loss_g)
++        opt_g.step()
++
++        with self._amp_ctx():
++            loss_d, disc_metrics = self._compute_d_part(y, y_hat.detach())
++        metrics.update(disc_metrics)
++
++        opt_d.zero_grad(set_to_none=True)
++        self.manual_backward(loss_d)
++        opt_d.step()
++
++        self.log("iters", float(self.true_global_step), batch_size=self.batch_size)
++        self.log("loss_g", loss_g, batch_size=self.batch_size)
++        self.log("loss_d", loss_d, batch_size=self.batch_size)
++        self.log_dict(
++            {f"train_{k}": v for k, v in metrics.items()},
++            batch_size=self.batch_size,
++        )
++        return None
++
++    def _compute_g_part(self, batch: Batch):
++        x, x_lengths, y, _, spec, spec_lengths, speaker_ids = (
++            batch.phoneme_ids, batch.phoneme_lengths, batch.audios,
++            batch.audio_lengths, batch.spectrograms, batch.spectrogram_lengths,
++            batch.speaker_ids if batch.speaker_ids is not None else None,
++        )
++        (
++            y_hat, l_length, _attn, ids_slice, _x_mask, z_mask,
++            (_z, z_p, m_p, logs_p, _m_q, logs_q),
++        ) = self.model_g(x, x_lengths, spec, spec_lengths, speaker_ids)
++
++        with autocast(self.device.type, enabled=False):
++            mel = spec_to_mel_torch(
++                spec.float(), self.hparams.filter_length, self.hparams.mel_channels,
++                self.hparams.sample_rate, self.hparams.mel_fmin, self.hparams.mel_fmax,
++            )
++            y_mel = slice_segments(
++                mel, ids_slice, self.hparams.segment_size // self.hparams.hop_length,
++            )
++            y_hat_mel = mel_spectrogram_torch(
++                y_hat.squeeze(1).float(), self.hparams.filter_length,
++                self.hparams.mel_channels, self.hparams.sample_rate,
++                self.hparams.hop_length, self.hparams.win_length,
++                self.hparams.mel_fmin, self.hparams.mel_fmax,
++            )
++        y = slice_segments(y, ids_slice * self.hparams.hop_length, self.hparams.segment_size)
++        y_hat = y_hat[..., : y.shape[-1]]
++
++        # замораживаем дискриминаторы: их градиенты на G-шаге не нужны
++        for _p in self.model_d.parameters():
++            _p.requires_grad_(False)
++        if self.model_mrd is not None:
++            for _p in self.model_mrd.parameters():
++                _p.requires_grad_(False)
++
++        _r, y_d_hat_g, fmap_r, fmap_g = self.model_d(y, y_hat)
++        if self.model_mrd is not None:
++            _dr, y_dr_g, fmap_r_mrd, fmap_g_mrd = self.model_mrd(y, y_hat)
++
++        with autocast(self.device.type, enabled=False):
++            mel_l1 = F.l1_loss(y_mel, y_hat_mel)
++            kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask)
++            loss_dur = torch.sum(l_length.float())
++            loss_fm = feature_loss(fmap_r, fmap_g)
++            loss_gen, _ = generator_loss(y_d_hat_g)
++            loss_gen_all = loss_gen + loss_fm + mel_l1 * self.hparams.c_mel                 + loss_dur + kl * self.hparams.c_kl
++            metrics = {
++                "mel": mel_l1.detach(), "kl": kl.detach(), "dur": loss_dur.detach(),
++                "fm": loss_fm.detach(), "gen": loss_gen.detach(),
++            }
++            if self.model_mrd is not None:
++                loss_mrd_fm = feature_loss(fmap_r_mrd, fmap_g_mrd)
++                loss_mrd_gen, _ = generator_loss(y_dr_g)
++                loss_gen_all = loss_gen_all + loss_mrd_gen + loss_mrd_fm
++                metrics["mrd_gen"] = loss_mrd_gen.detach()
++                metrics["mrd_fm"] = loss_mrd_fm.detach()
++        return y, y_hat, loss_gen_all, metrics
++
++    def _compute_d_part(self, y, y_hat_det):
++        for _p in self.model_d.parameters():
++            _p.requires_grad_(True)
++        if self.model_mrd is not None:
++            for _p in self.model_mrd.parameters():
++                _p.requires_grad_(True)
++
++        y_d_hat_r, y_d_hat_g, _, _ = self.model_d(y, y_hat_det)
++        if self.model_mrd is not None:
++            y_dr_r, y_dr_g, _, _ = self.model_mrd(y, y_hat_det)
++        with autocast(self.device.type, enabled=False):
++            loss_disc, _, _ = discriminator_loss(y_d_hat_r, y_d_hat_g)
++            loss_disc_all = loss_disc
++            metrics = {"disc": loss_disc.detach()}
++            if self.model_mrd is not None:
++                loss_mrd_disc, _, _ = discriminator_loss(y_dr_r, y_dr_g)
++                loss_disc_all = loss_disc_all + loss_mrd_disc
++                metrics["mrd_disc"] = loss_mrd_disc.detach()
++        return loss_disc_all, metrics
++
+     def training_step(self, batch: Batch, batch_idx: int):
++        if os.environ.get("PIPER_SPLIT_GD") == "1":
++            return self._train_step_split(batch, batch_idx)
+         opt_g, opt_d = self.optimizers()
+-        loss_g, loss_d, metrics = self._compute_loss(batch)
++        _pr = getattr(self, "_prof", None)
++        if _pr is not None:
++            _pr.step()
++        _pr2 = getattr(self, "_prof2", None)
++        if _pr2 is not None:
++            _pr2.step()
++        _prof = os.environ.get("PIPER_TIMERS") == "1"
++        if _prof:
++            _t0 = time.perf_counter()
++        with self._amp_ctx():
++            loss_g, loss_d, metrics = self._compute_loss(batch)
++        if _prof:
++            torch.xpu.synchronize()
++            _t1 = time.perf_counter()
+ 
+         # Logged so the real iteration count is visible next to the losses,
+         # rather than only the doubled global_step -- see true_global_step.
+@@ -405,19 +598,124 @@
+             {f"train_{name}": value for name, value in metrics.items()},
+             batch_size=self.batch_size,
+         )
++        _st = os.environ.get("PIPER_STEP_TIMING") == "1"
++        if _st:
++            torch.xpu.synchronize(); _s0 = time.perf_counter()
+         opt_g.zero_grad()
+         # No retain_graph: loss_d is built from an independent discriminator
+         # forward on y_hat.detach(), so freeing the generator graph here is
+         # safe and cuts peak memory (lets larger batches fit on 24 GB).
+         self.manual_backward(loss_g)
++        if _st:
++            torch.xpu.synchronize(); _s1 = time.perf_counter()
+         opt_g.step()
++        if _st:
++            torch.xpu.synchronize(); _s2 = time.perf_counter()
+ 
+         self.log("loss_d", loss_d, batch_size=self.batch_size)
+         opt_d.zero_grad()
+         self.manual_backward(loss_d)
++        if _st:
++            torch.xpu.synchronize(); _s3 = time.perf_counter()
+         opt_d.step()
++        if _st:
++            torch.xpu.synchronize(); _s4 = time.perf_counter()
++            if batch_idx % 10 == 0:
++                _LOGGER.info(
++                    "PIPER_STEP_TIMING bwd_g=%.3f step_g=%.3f bwd_d=%.3f step_d=%.3f",
++                    _s1 - _s0, _s2 - _s1, _s3 - _s2, _s4 - _s3,
++                )
++
++        if _prof:
++            torch.xpu.synchronize()
++            _t2 = time.perf_counter()
++            _prev = getattr(self, "_prof_prev", None)
++            self._prof_prev = _t2
++            if batch_idx % 10 == 0:
++                _total = (_t2 - _prev) if _prev else float("nan")
++                _LOGGER.info(
++                    "PIPER_PROF batch=%d forward=%.3f backward_opt=%.3f since_prev=%.3f",
++                    batch_idx, _t1 - _t0, _t2 - _t1, _total,
++                )
+ 
+     def on_train_start(self) -> None:
++        self._t_train_start = time.time()
++        if os.environ.get("PIPER_CONV2D") == "1":
++            import sys as _sys
++            _sys.path.insert(0, r"<PROJECT>\tools\piper")
++            from conv1d_to_conv2d import convert_model
++            convert_model(self.model_g, "generator")
++            convert_model(self.model_d, "mpd")
++            if self.model_mrd is not None:
++                convert_model(self.model_mrd, "mrd")
++            self.model_g.to(self.device)
++            self.model_d.to(self.device)
++            if self.model_mrd is not None:
++                self.model_mrd.to(self.device)
++            _p0 = next(self.model_g.parameters())
++            _LOGGER.info(
++                "PIPER_CONV2D=1: device=%s, вес генератора на %s",
++                self.device, _p0.device,
++            )
++
++        if os.environ.get("PIPER_D_FREEZE_ALL") == "1":
++            for _p in self.model_d.parameters():
++                _p.requires_grad_(False)
++            if self.model_mrd is not None:
++                for _p in self.model_mrd.parameters():
++                    _p.requires_grad_(False)
++            _LOGGER.info("PIPER_D_FREEZE_ALL=1: веса дискриминаторов заморожены (только замер)")
++        if os.environ.get("PIPER_PROFILE2") == "1":
++            from torch.profiler import profile, ProfilerActivity
++
++            def _trace_ready(pr):
++                try:
++                    _LOGGER.info(
++                        "PIPER_TRACE_TABLE %s",
++                        pr.key_averages().table(
++                            sort_by="self_device_time_total", row_limit=25
++                        ),
++                    )
++                    pr.export_chrome_trace(
++                        os.environ.get("PIPER_TRACE_OUT", "trace.json")
++                    )
++                except Exception:
++                    _LOGGER.debug("не удалось снять трейс", exc_info=True)
++
++            self._prof2 = profile(
++                activities=[ProfilerActivity.CPU, ProfilerActivity.XPU],
++                schedule=torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1),
++                on_trace_ready=_trace_ready,
++            )
++            self._prof2.__enter__()
++            _LOGGER.info("PIPER_PROFILE2: короткий трейс включён")
++        if os.environ.get("PIPER_PROFILE") == "1":
++            from torch.profiler import profile, ProfilerActivity
++            self._prof = profile(
++                activities=[ProfilerActivity.CPU, ProfilerActivity.XPU],
++                schedule=torch.profiler.schedule(wait=3, warmup=2, active=8, repeat=1),
++                on_trace_ready=lambda pr: _LOGGER.info(
++                    "PIPER_PROFILE_TABLE %s",
++                    pr.key_averages().table(sort_by="self_cpu_time_total", row_limit=20),
++                ),
++            )
++            self._prof.__enter__()
++            _LOGGER.info("PIPER_PROFILE: профайлер включён")
++        frac = os.environ.get("PIPER_XPU_MEM_FRACTION", "").strip()
++        if frac:
++            try:
++                torch.xpu.set_per_process_memory_fraction(float(frac), device=0)
++                _LOGGER.info("XPU: лимит памяти процесса %.2f от VRAM", float(frac))
++            except Exception:  # noqa: BLE001
++                _LOGGER.warning("XPU: не удалось выставить лимит памяти %.2f", frac)
++        try:
++            torch.xpu.reset_peak_memory_stats()
++            _LOGGER.info("XPU: пики памяти сброшены перед прогоном")
++        except Exception:  # noqa: BLE001
++            _LOGGER.debug("XPU: reset_peak_memory_stats недоступен", exc_info=True)
++        if os.environ.get("PIPER_BF16") == "1":
++            self.bfloat16()
++            _LOGGER.info("PIPER_BF16=1: модель переведена в bfloat16")
+         self._reassert_scheduler_gammas()
+ 
+         # Never let a diagnostic take down a run that was about to start.
+@@ -477,7 +775,11 @@
+         sizes = []
+         for utt in utterances[::step][:limit]:
+             try:
+-                sizes.append(os.path.getsize(utt.audio_norm_path))
++                sizes.append(
++                    utt.length_bytes
++                    if getattr(utt, "is_compact", False)
++                    else os.path.getsize(utt.audio_norm_path)
++                )
+             except OSError:
+                 continue
+         if not sizes:
+@@ -547,7 +849,8 @@
+             scheduler.step()
+ 
+     def validation_step(self, batch: Batch, batch_idx: int):
+-        loss_g, _loss_d, metrics = self._compute_loss(batch)
++        with self._amp_ctx():
++            loss_g, _loss_d, metrics = self._compute_loss(batch)
+         val_loss = loss_g  # kept for backwards compatibility
+         self.log("val_loss", val_loss, batch_size=self.batch_size)
+ 
+@@ -668,6 +971,7 @@
+             getattr(self, "logger", None)
+             and hasattr(self.logger, "experiment")
+             and hasattr(self.logger.experiment, "add_audio")
++            and os.environ.get("PIPER_NO_AUDIO_LOG") != "1"
+         )
+         mos_enabled = self._mos_predictor is not None
+ 
+@@ -778,20 +1082,41 @@
+         if self.model_mrd is not None:
+             disc_params += list(self.model_mrd.parameters())
+ 
+-        optimizers = [
+-            torch.optim.AdamW(
+-                self.model_g.parameters(),
+-                lr=self.hparams.learning_rate,
+-                betas=self.hparams.betas,
+-                eps=self.hparams.eps,
+-            ),
+-            torch.optim.AdamW(
+-                disc_params,
+-                lr=self.hparams.learning_rate_d,
+-                betas=self.hparams.betas_d,
+-                eps=self.hparams.eps,
+-            ),
+-        ]
++        _fused = os.environ.get("PIPER_FUSED_ADAM") == "1"
++        _foreach = os.environ.get("PIPER_FOREACH_ADAM", "1") == "1"
++        # foreach объединяет мелкие тензоры в один апдейт: меньше запусков ядер.
++        _candidates = []
++        if _fused:
++            _candidates.append({"fused": True})
++        if _foreach:
++            _candidates.append({"foreach": True})
++        _candidates.append({})
++
++        optimizers = None
++        for _kw in _candidates:
++            try:
++                optimizers = [
++                    torch.optim.AdamW(
++                        self.model_g.parameters(),
++                        lr=float(os.environ.get("PIPER_LR", self.hparams.learning_rate)),
++                        betas=self.hparams.betas,
++                        eps=self.hparams.eps,
++                        **_kw,
++                    ),
++                    torch.optim.AdamW(
++                        disc_params,
++                        lr=float(os.environ.get("PIPER_LR_D", self.hparams.learning_rate_d)),
++                        betas=self.hparams.betas_d,
++                        eps=self.hparams.eps,
++                        **_kw,
++                    ),
++                ]
++                _LOGGER.info("AdamW: параметры %s", _kw or "по умолчанию")
++                break
++            except (TypeError, RuntimeError) as exc:
++                _LOGGER.warning("AdamW %s недоступен: %s", _kw, exc)
++        if optimizers is None:
++            raise RuntimeError("не удалось создать AdamW ни с одним набором параметров")
+         self._resolved_gammas = [
+             self._resolve_lr_decay(
+                 self.hparams.lr_decay, _UPSTREAM_LR_DECAY, "lr_decay"
